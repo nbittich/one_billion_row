@@ -1,9 +1,9 @@
-use crossbeam::channel::Sender;
 use itertools::Itertools;
+use memmap2::{Advice, MmapOptions};
 use std::collections::VecDeque;
-use std::io::Read;
 use std::str::FromStr;
-use std::u16;
+use std::sync::Arc;
+use std::time::SystemTime;
 use std::{collections::HashMap, fs::File, thread::JoinHandle};
 
 #[derive(Default, Clone, Debug)]
@@ -19,62 +19,6 @@ fn main() {
         run();
     }
 }
-#[inline]
-unsafe fn process_measurement(
-    key: &[u8],
-    num: &[u8],
-    dec: Option<&[u8]>,
-    signed: u16,
-    measurements: &mut HashMap<Vec<u8>, Measurement>,
-) {
-    let to_num = |num: &[u8], signed: u16| {
-        let mut integer = 0;
-        for n in num {
-            integer = integer * 10 + (n - b'0') as i32;
-        }
-
-        if signed == 1 {
-            integer = -integer;
-        }
-        integer
-    };
-    let mut v = num.to_vec();
-
-    if let Some(dec) = dec {
-        v.extend_from_slice(dec);
-        if dec.len() != 3 {
-            v.extend_from_slice(&[b'0', b'0']);
-        }
-    } else {
-        v.extend_from_slice(&[b'0', b'0', b'0']);
-    }
-
-    let n = to_num(&v, signed);
-
-    if let Some(measurement) = measurements.get_mut(key) {
-        if measurement.min > n {
-            measurement.min = n;
-        } else if measurement.max < n {
-            measurement.max = n;
-        }
-        measurement.tot += n as i64;
-        measurement.count += 1;
-    } else {
-        measurements.insert(
-            key.into(),
-            Measurement {
-                min: n,
-                max: n,
-                tot: n as i64,
-                count: 1,
-            },
-        );
-    }
-}
-struct Worker {
-    sender: Sender<Vec<u8>>,
-    handle: JoinHandle<HashMap<Vec<u8>, Measurement>>,
-}
 
 const BUF_SIZE: usize = 256;
 
@@ -89,117 +33,149 @@ fn last_newline(s: &[u8]) -> usize {
     }
     s.len()
 }
-impl Worker {
-    fn new() -> Self {
-        let (sender, receiver) = crossbeam::channel::bounded(1);
-        Self {
-            sender,
-            handle: std::thread::spawn(move || {
-                let mut measurements: HashMap<Vec<u8>, Measurement> =
-                    HashMap::with_capacity(BUF_SIZE);
-                loop {
-                    match receiver.recv() {
-                        Ok(buffers) => unsafe {
-                            let mut start_key = 0;
-                            let mut end_key = 0;
-                            let mut start_num = 0;
-                            let mut end_num = 0;
-                            let mut signed = 0;
-                            let mut start_dec = None;
-                            let mut end_dec = None;
-
-                            for i in 0..buffers.len() {
-                                if buffers[i] == b';' {
-                                    end_key = i;
-                                    start_num = i + 1;
-                                    continue;
-                                }
-                                if buffers[i] == b'-' {
-                                    signed = 1;
-                                    start_num = i + 1;
-                                    continue;
-                                }
-                                if buffers[i] == b'.' {
-                                    end_num = i;
-                                    start_dec = Some(i + 1);
-                                    continue;
-                                }
-
-                                if buffers[i] == b'\n' {
-                                    if start_dec.is_some() {
-                                        end_dec = Some(i);
-                                    } else {
-                                        end_num = i;
-                                    }
-                                    let dec = if let (Some(start_dec), Some(end_dec)) =
-                                        (start_dec, end_dec)
-                                    {
-                                        Some(&buffers[start_dec..end_dec])
-                                    } else {
-                                        None
-                                    };
-
-                                    process_measurement(
-                                        &buffers[start_key..end_key],
-                                        &buffers[start_num..end_num],
-                                        dec,
-                                        signed,
-                                        &mut measurements,
-                                    );
-                                    start_key = i + 1;
-
-                                    start_dec = None;
-                                    end_dec = None;
-                                    signed = 0;
-                                }
-                            }
-                        },
-                        Err(_) => {
-                            break;
-                        }
-                    }
-                }
-
-                measurements
-            }),
-        }
-    }
-}
-
-const CHUNK_SIZE: usize = 64_000_000;
-
 unsafe fn run() {
-    let mut f = File::open("./measurements.txt").unwrap();
-    let thread_counts = std::thread::available_parallelism().unwrap().get();
-    let mut chunk = Vec::with_capacity(CHUNK_SIZE);
+    let f = File::open("./measurements.txt").unwrap();
+    let metadata = std::fs::metadata("./measurements.txt").unwrap();
+    let mem_map = Arc::new(MmapOptions::new().map(&f).unwrap());
+    let default_thread_counts = std::thread::available_parallelism().unwrap().get();
+
+    let thread_counts = {
+        if let Some((t, c)) = std::env::args().skip(1).take(2).next_tuple() {
+            if t == "--num-threads" || t == "--threads" || t == "-t" {
+                c.trim()
+                    .parse::<usize>()
+                    .expect("useage: -t <number_of_threads>")
+            } else {
+                default_thread_counts
+            }
+        } else {
+            default_thread_counts
+        }
+    };
+    println!("thread counts: {thread_counts}");
 
     let mut measurements: HashMap<Vec<u8>, Measurement> = HashMap::with_capacity(BUF_SIZE);
 
-    let mut workers: VecDeque<Worker> = VecDeque::with_capacity(thread_counts);
-    for _ in 0..thread_counts - 1 {
-        workers.push_back(Worker::new());
+    let mut thread_workers: VecDeque<JoinHandle<HashMap<Vec<u8>, Measurement>>> =
+        VecDeque::with_capacity(thread_counts);
+
+    let file_len = metadata.len() as usize;
+
+    let max_chunks_size = file_len / thread_counts;
+    let mut offset = 0;
+
+    let mut now = SystemTime::now();
+
+    while offset < file_len {
+        let end = {
+            let end = offset + max_chunks_size;
+            if end > file_len {
+                file_len
+            } else {
+                end
+            }
+        };
+        let last_new_line = offset + last_newline(&mem_map[offset..end]);
+
+        let mem_map = mem_map.clone();
+        thread_workers.push_back(std::thread::spawn(move || {
+            let mut measurements: HashMap<Vec<u8>, Measurement> = HashMap::with_capacity(BUF_SIZE);
+            if cfg!(unix) {
+                mem_map
+                    .advise_range(Advice::Sequential, offset, last_new_line - offset)
+                    .unwrap_unchecked();
+            }
+            let buffers = &mem_map[offset..last_new_line];
+            let len = buffers.len();
+            let mut signed: i32 = 1;
+            let mut start_dec = None;
+            let mut key = Vec::with_capacity(1024);
+            let mut num = 0;
+            let mut i;
+            let mut j = 0;
+
+            loop {
+                i = j;
+                j += 1;
+                let v = &buffers[i];
+                if v == &b';' {
+                    continue;
+                }
+                if v == &b'-' {
+                    signed = -1;
+                    continue;
+                }
+                if v == &b'.' {
+                    start_dec = Some(i + 1);
+                    continue;
+                }
+
+                if v.is_ascii_digit() {
+                    num = num * 10 + (v - b'0') as i32;
+
+                    continue;
+                }
+
+                if v == &b'\n' {
+                    if let Some(sd) = start_dec {
+                        let number_dec = i - sd;
+                        if number_dec & 1 == 1 {
+                            num *= 100;
+                        }
+                    } else {
+                        num *= 1000;
+                    }
+
+                    num *= signed;
+                    let data: &[u8] = &key;
+
+                    if let Some(measurement) = measurements.get_mut(data) {
+                        if measurement.min > num {
+                            measurement.min = num;
+                        } else if measurement.max < num {
+                            measurement.max = num;
+                        }
+                        measurement.tot += num as i64;
+                        measurement.count += 1;
+                    } else {
+                        measurements.insert(
+                            data.into(),
+                            Measurement {
+                                min: num,
+                                max: num,
+                                tot: num as i64,
+                                count: 1,
+                            },
+                        );
+                    }
+                    key.clear();
+                    num = 0;
+
+                    start_dec = None;
+                    signed = 1;
+                    if j >= len {
+                        break;
+                    }
+                    continue;
+                }
+                key.push(*v);
+            }
+
+            measurements
+        }));
+
+        offset = last_new_line;
     }
-
-    loop {
-        f.by_ref()
-            .take((CHUNK_SIZE - chunk.len()) as u64)
-            .read_to_end(&mut chunk)
-            .unwrap_unchecked();
-
-        if chunk.is_empty() {
-            break;
-        }
-        let last_newline = last_newline(&chunk);
-        let mut next_chunk = Vec::with_capacity(CHUNK_SIZE);
-        next_chunk.extend_from_slice(&chunk[last_newline..]);
-        let worker = workers.pop_front().unwrap_unchecked();
-        worker.sender.send(chunk).unwrap_unchecked();
-        workers.push_back(worker);
-        chunk = next_chunk;
+    if cfg!(debug) {
+        println!(
+            "took {:.2} millis to spawn threads",
+            now.elapsed().unwrap_unchecked().as_millis()
+        );
     }
+    now = SystemTime::now();
 
-    while let Some(Worker { handle, sender }) = workers.pop_front() {
-        drop(sender);
+    while let Some(handle) = thread_workers.pop_front() {
+        let now2 = SystemTime::now();
         let a = handle.join().unwrap_unchecked();
         for (k, v) in a {
             if let Some(m) = measurements.get_mut(&k) {
@@ -215,8 +191,19 @@ unsafe fn run() {
                 measurements.insert(k, v);
             }
         }
+        if cfg!(debug) {
+            println!(
+                "took {:.2} millis to join threads",
+                now2.elapsed().unwrap_unchecked().as_millis()
+            );
+        }
     }
-
+    if cfg!(debug) {
+        println!(
+            "took {:.2} millis to merge threads",
+            now.elapsed().unwrap_unchecked().as_millis()
+        );
+    }
     let mut res = String::from_str("{").unwrap_unchecked();
     for (i, (k, m)) in measurements
         .iter()
