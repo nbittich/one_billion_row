@@ -1,6 +1,5 @@
-use itertools::Itertools;
 use memmap2::{Advice, MmapOptions};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -40,7 +39,8 @@ unsafe fn run() {
     let default_thread_counts = std::thread::available_parallelism().unwrap().get();
 
     let thread_counts = {
-        if let Some((t, c)) = std::env::args().skip(1).take(2).next_tuple() {
+        let thread_arg = std::env::args().skip(1).take(2).collect::<Vec<_>>();
+        if let [t, c, ..] = thread_arg.as_slice() {
             if t == "--num-threads" || t == "--threads" || t == "-t" {
                 c.trim()
                     .parse::<usize>()
@@ -61,7 +61,8 @@ unsafe fn run() {
 
     let file_len = metadata.len() as usize;
 
-    let max_chunks_size = file_len / thread_counts;
+    let mut max_chunks_size = file_len / thread_counts;
+    max_chunks_size -= max_chunks_size % 4096;
     let mut offset = 0;
 
     let mut now = SystemTime::now();
@@ -85,20 +86,16 @@ unsafe fn run() {
                     .advise_range(Advice::Sequential, offset, last_new_line - offset)
                     .unwrap_unchecked();
             }
-            let buffers = &mem_map[offset..last_new_line];
-            let len = buffers.len();
-            let mut signed: i32 = 1;
-            let mut start_dec = None;
-            let mut key = Vec::with_capacity(1024);
-            let mut num = 0;
-            let mut i;
-            let mut j = 0;
+            let mut signed = 1;
+            let mut key = [0; 100];
 
-            loop {
-                i = j;
-                j += 1;
-                let v = &buffers[i];
+            let mut num = 0;
+            let mut next_k = 0;
+            let mut end_k = 0;
+
+            for v in &mem_map[offset..last_new_line] {
                 if v == &b';' {
+                    end_k = next_k;
                     continue;
                 }
                 if v == &b'-' {
@@ -106,28 +103,12 @@ unsafe fn run() {
                     continue;
                 }
                 if v == &b'.' {
-                    start_dec = Some(i + 1);
-                    continue;
-                }
-
-                if v.is_ascii_digit() {
-                    num = num * 10 + (v - b'0') as i32;
-
                     continue;
                 }
 
                 if v == &b'\n' {
-                    if let Some(sd) = start_dec {
-                        let number_dec = i - sd;
-                        if number_dec & 1 == 1 {
-                            num *= 100;
-                        }
-                    } else {
-                        num *= 1000;
-                    }
-
-                    num *= signed;
-                    let data: &[u8] = &key;
+                    num *= 100 * signed;
+                    let data: &[u8] = &key[0..end_k];
 
                     if let Some(measurement) = measurements.get_mut(data) {
                         if measurement.min > num {
@@ -148,19 +129,21 @@ unsafe fn run() {
                             },
                         );
                     }
-                    key.clear();
-                    num = 0;
 
-                    start_dec = None;
+                    num = 0;
+                    next_k = 0;
                     signed = 1;
-                    if j >= len {
-                        break;
-                    }
+
                     continue;
                 }
-                key.push(*v);
-            }
 
+                if v.is_ascii_digit() {
+                    num = num * 10 + (v - b'0') as i32;
+                    continue;
+                }
+                key[next_k] = *v;
+                next_k += 1;
+            }
             measurements
         }));
 
@@ -205,10 +188,13 @@ unsafe fn run() {
         );
     }
     let mut res = String::from_str("{").unwrap_unchecked();
-    for (i, (k, m)) in measurements
-        .iter()
-        .map(|e| (std::str::from_utf8(e.0).unwrap_unchecked(), e.1))
-        .sorted_by(|l, r| l.0.cmp(r.0))
+
+    let ml = measurements.len();
+    let keys = measurements.keys().collect::<BTreeSet<_>>();
+    for (i, (k, m)) in keys
+        .into_iter()
+        .map(|k| measurements.get_key_value(k).unwrap_unchecked())
+        .map(|e| (std::str::from_utf8(&e.0[..]).unwrap_unchecked(), e.1))
         .enumerate()
     {
         res += &format!(
@@ -218,11 +204,10 @@ unsafe fn run() {
             m.tot as f64 / 1000. / m.count as f64,
             m.max as f64 / 1000.
         );
-        if i < measurements.len() - 1 {
+        if i < ml - 1 {
             res.push_str(", ")
         }
     }
     res.push('}');
     println!("{res}");
-    println!();
 }
