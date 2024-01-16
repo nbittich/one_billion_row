@@ -1,7 +1,6 @@
-use memmap2::{Advice, MmapOptions};
+use memmap2::{Advice, Mmap, MmapOptions};
 use std::collections::{BTreeSet, VecDeque};
 use std::str::FromStr;
-use std::sync::Arc;
 use std::time::SystemTime;
 use std::{collections::HashMap, fs::File, thread::JoinHandle};
 
@@ -36,7 +35,8 @@ fn last_newline(s: &[u8]) -> usize {
 unsafe fn run() {
     let f = File::open("./measurements.txt").unwrap();
     let metadata = std::fs::metadata("./measurements.txt").unwrap();
-    let mem_map = Arc::new(MmapOptions::new().map(&f).unwrap());
+    let mem_map = MmapOptions::new().map(&f).unwrap();
+    let mem_map: &'static Mmap = std::mem::transmute(&mem_map);
     let default_thread_counts = std::thread::available_parallelism().unwrap().get();
 
     let thread_counts = {
@@ -79,7 +79,6 @@ unsafe fn run() {
         };
         let last_new_line = offset + last_newline(&mem_map[offset..end]);
 
-        let mem_map = mem_map.clone();
         thread_workers.push_back(std::thread::spawn(move || {
             let mut measurements: HashMap<Vec<u8>, Measurement> = HashMap::with_capacity(BUF_SIZE);
             if cfg!(unix) {
