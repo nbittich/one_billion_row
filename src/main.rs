@@ -152,27 +152,24 @@ unsafe fn run() {
     now = SystemTime::now();
 
     while let Some(handle) = thread_workers.pop_front() {
-        let now2 = SystemTime::now();
-        let a = handle.join().unwrap_unchecked();
-        for (k, v) in a {
-            if let Some(m) = measurements.get_mut(&k) {
-                m.tot += v.tot;
-                m.count += v.count;
-                if m.min > v.min {
-                    m.min = v.min;
+        if handle.is_finished() {
+            let a = handle.join().unwrap_unchecked();
+            for (k, v) in a {
+                if let Some(m) = measurements.get_mut(&k) {
+                    m.tot += v.tot;
+                    m.count += v.count;
+                    if m.min > v.min {
+                        m.min = v.min;
+                    }
+                    if m.max < v.max {
+                        m.max = v.max;
+                    }
+                } else {
+                    measurements.insert(k, v);
                 }
-                if m.max < v.max {
-                    m.max = v.max;
-                }
-            } else {
-                measurements.insert(k, v);
             }
-        }
-        if cfg!(debug) {
-            println!(
-                "took {:.2} millis to join threads",
-                now2.elapsed().unwrap_unchecked().as_millis()
-            );
+        } else {
+            thread_workers.push_back(handle);
         }
     }
     if cfg!(debug) {
