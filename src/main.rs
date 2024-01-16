@@ -18,7 +18,7 @@ fn main() {
     }
 }
 
-const BUF_SIZE: usize = 256;
+const BUF_SIZE: usize = 100;
 
 #[inline]
 fn last_newline(s: &[u8]) -> usize {
@@ -131,7 +131,7 @@ unsafe fn run() {
                     signed = 1;
                 } else {
                     if v == &b'-' {
-                        signed *= -1;
+                        signed = -1;
                     } else if v == &b'.' {
                     } else {
                         num = ((num << 3) + (num << 1)) + (v - b'0') as i32;
