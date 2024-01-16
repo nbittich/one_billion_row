@@ -32,6 +32,7 @@ fn last_newline(s: &[u8]) -> usize {
     }
     s.len()
 }
+#[inline]
 unsafe fn run() {
     let f = File::open("./measurements.txt").unwrap();
     let metadata = std::fs::metadata("./measurements.txt").unwrap();
@@ -94,20 +95,15 @@ unsafe fn run() {
             let mut end_k = 0;
 
             for v in &mem_map[offset..last_new_line] {
-                if v == &b';' {
-                    end_k = next_k;
-                    continue;
-                }
-                if v == &b'-' {
-                    signed = -1;
-                    continue;
-                }
-                if v == &b'.' {
-                    continue;
-                }
-
-                if v == &b'\n' {
-                    num *= 100 * signed;
+                if end_k == 0 {
+                    if v == &b';' {
+                        end_k = next_k;
+                    } else {
+                        key[next_k] = *v;
+                        next_k += 1;
+                    }
+                } else if v == &b'\n' {
+                    num *= signed;
                     let data: &[u8] = &key[0..end_k];
 
                     if let Some(measurement) = measurements.get_mut(data) {
@@ -132,17 +128,16 @@ unsafe fn run() {
 
                     num = 0;
                     next_k = 0;
+                    end_k = 0;
                     signed = 1;
-
-                    continue;
+                } else {
+                    if v == &b'-' {
+                        signed *= -1;
+                    } else if v == &b'.' {
+                    } else {
+                        num = ((num << 3) + (num << 1)) + (v - b'0') as i32;
+                    }
                 }
-
-                if v.is_ascii_digit() {
-                    num = num * 10 + (v - b'0') as i32;
-                    continue;
-                }
-                key[next_k] = *v;
-                next_k += 1;
             }
             measurements
         }));
@@ -200,9 +195,9 @@ unsafe fn run() {
         res += &format!(
             "{}={:.1}/{:.1}/{:.1}",
             k,
-            m.min as f64 / 1000.,
-            m.tot as f64 / 1000. / m.count as f64,
-            m.max as f64 / 1000.
+            (m.min * 100) as f64 / 1000.,
+            (m.tot * 100) as f64 / 1000. / m.count as f64,
+            (m.max * 100) as f64 / 1000.
         );
         if i < ml - 1 {
             res.push_str(", ")
