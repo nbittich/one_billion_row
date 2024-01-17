@@ -4,7 +4,6 @@ use std::str::FromStr;
 use std::time::SystemTime;
 use std::{collections::HashMap, fs::File, thread::JoinHandle};
 
-#[derive(Default, Clone, Debug)]
 struct Measurement {
     min: i32,
     max: i32,
@@ -33,19 +32,19 @@ fn last_newline(s: &[u8]) -> usize {
 }
 #[inline]
 unsafe fn run() {
-    let f = File::open("./measurements.txt").unwrap();
-    let metadata = std::fs::metadata("./measurements.txt").unwrap();
-    let mem_map = MmapOptions::new().map(&f).unwrap();
+    let f = File::open("./measurements.txt").unwrap_unchecked();
+    let metadata = std::fs::metadata("./measurements.txt").unwrap_unchecked();
+    let mem_map = MmapOptions::new().map(&f).unwrap_unchecked();
     let mem_map: &'static Mmap = std::mem::transmute(&mem_map);
-    let default_thread_counts = std::thread::available_parallelism().unwrap().get();
+    let default_thread_counts = std::thread::available_parallelism()
+        .unwrap_unchecked()
+        .get();
 
     let thread_counts = {
         let thread_arg = std::env::args().skip(1).take(2).collect::<Vec<_>>();
         if let [t, c, ..] = thread_arg.as_slice() {
             if t == "--num-threads" || t == "--threads" || t == "-t" {
-                c.trim()
-                    .parse::<usize>()
-                    .expect("useage: -t <number_of_threads>")
+                c.trim().parse::<usize>().unwrap_unchecked()
             } else {
                 default_thread_counts
             }
